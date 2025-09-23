@@ -9,6 +9,9 @@
 (define-constant ERR-NOT-DELIVERY-PERSON (err u106))
 (define-constant ERR-INVALID-RECIPIENT (err u107))
 (define-constant ERR-MEAL-NOT-READY (err u108))
+(define-constant ERR-INSUFFICIENT-POINTS (err u109))
+(define-constant ERR-INVALID-REDEMPTION (err u110))
+(define-constant ERR-ALREADY-REDEEMED (err u111))
 
 (define-constant MEAL-STATUS-ORDERED u0)
 (define-constant MEAL-STATUS-PREPARING u1)
@@ -50,6 +53,25 @@
 })
 
 (define-map customer-orders principal (list 50 uint))
+
+(define-map loyalty-points principal {
+    points: uint,
+    total-spent: uint,
+    total-orders: uint,
+    last-earned-at: uint
+})
+
+(define-map redemption-records uint {
+    customer: principal,
+    points-used: uint,
+    discount-applied: uint,
+    redeemed: bool
+})
+
+(define-constant POINTS-PER-ORDER u10)
+(define-constant POINTS-PER-100-STX u5)
+(define-constant MAX-DISCOUNT-PCT u20)
+(define-constant DISCOUNT-DIVISOR u100)
 
 (define-public (register-restaurant (name (string-ascii 100)))
     (begin
@@ -183,6 +205,7 @@
             current-deliveries: (- (get current-deliveries delivery-data) u1),
             total-deliveries: (+ (get total-deliveries delivery-data) u1)
         }))
+        (unwrap! (award-loyalty-points (get customer meal-data) (get price meal-data)) (ok true))
         (ok true)
     )
 )
@@ -269,4 +292,116 @@
 
 (define-read-only (get-contract-owner)
     (ok (var-get contract-owner))
+)
+
+(define-private (award-loyalty-points (customer principal) (order-amount uint))
+    (let (
+        (current-loyalty (default-to 
+            { points: u0, total-spent: u0, total-orders: u0, last-earned-at: u0 }
+            (map-get? loyalty-points customer)
+        ))
+        (base-points POINTS-PER-ORDER)
+        (spending-points (/ (* order-amount POINTS-PER-100-STX) u100000000))
+        (total-points (+ base-points spending-points))
+    )
+        (map-set loyalty-points customer {
+            points: (+ (get points current-loyalty) total-points),
+            total-spent: (+ (get total-spent current-loyalty) order-amount),
+            total-orders: (+ (get total-orders current-loyalty) u1),
+            last-earned-at: stacks-block-height
+        })
+        (ok total-points)
+    )
+)
+
+(define-read-only (get-loyalty-points (customer principal))
+    (map-get? loyalty-points customer)
+)
+
+(define-read-only (calculate-discount (customer principal) (points-to-use uint))
+    (let (
+        (customer-loyalty (map-get? loyalty-points customer))
+    )
+        (match customer-loyalty
+            some-loyalty (let (
+                (available-points (get points some-loyalty))
+                (discount-percentage (if (<= (/ points-to-use u10) MAX-DISCOUNT-PCT) 
+                                        (/ points-to-use u10) 
+                                        MAX-DISCOUNT-PCT))
+            )
+                (if (>= available-points points-to-use)
+                    (ok discount-percentage)
+                    ERR-INSUFFICIENT-POINTS
+                )
+            )
+            ERR-INSUFFICIENT-POINTS
+        )
+    )
+)
+
+(define-public (place-order-with-loyalty (restaurant principal) (meal-name (string-ascii 50)) (price uint) (freshness-guarantee uint) (points-to-use uint))
+    (let (
+        (nft-id (+ (var-get nft-counter) u1))
+        (current-orders (default-to (list) (map-get? customer-orders tx-sender)))
+        (discount-pct (try! (calculate-discount tx-sender points-to-use)))
+        (discount-amount (/ (* price discount-pct) DISCOUNT-DIVISOR))
+        (final-price (- price discount-amount))
+        (customer-loyalty (unwrap! (map-get? loyalty-points tx-sender) ERR-INSUFFICIENT-POINTS))
+    )
+        (asserts! (is-some (map-get? restaurants restaurant)) ERR-NOT-RESTAURANT)
+        (asserts! (>= (get points customer-loyalty) points-to-use) ERR-INSUFFICIENT-POINTS)
+        (try! (nft-mint? meal-nft nft-id tx-sender))
+        
+        (map-set meals nft-id {
+            customer: tx-sender,
+            restaurant: restaurant,
+            delivery-person: none,
+            meal-name: meal-name,
+            order-time: stacks-block-height,
+            prep-time: none,
+            ready-time: none,
+            pickup-time: none,
+            delivery-time: none,
+            status: MEAL-STATUS-ORDERED,
+            freshness-guarantee: freshness-guarantee,
+            price: final-price
+        })
+        
+        (map-set redemption-records nft-id {
+            customer: tx-sender,
+            points-used: points-to-use,
+            discount-applied: discount-amount,
+            redeemed: true
+        })
+        
+        (map-set loyalty-points tx-sender (merge customer-loyalty {
+            points: (- (get points customer-loyalty) points-to-use)
+        }))
+        
+        (map-set customer-orders tx-sender (unwrap! (as-max-len? (append current-orders nft-id) u50) ERR-INVALID-RECIPIENT))
+        (var-set nft-counter nft-id)
+        (ok nft-id)
+    )
+)
+
+(define-read-only (get-redemption-info (nft-id uint))
+    (map-get? redemption-records nft-id)
+)
+
+(define-read-only (get-customer-loyalty-stats (customer principal))
+    (let (
+        (loyalty-data (map-get? loyalty-points customer))
+    )
+        (match loyalty-data
+            some-data (ok {
+                available-points: (get points some-data),
+                total-spent: (get total-spent some-data),
+                total-orders: (get total-orders some-data),
+                potential-discount: (if (<= (/ (get points some-data) u10) MAX-DISCOUNT-PCT)
+                                      (/ (get points some-data) u10)
+                                      MAX-DISCOUNT-PCT)
+            })
+            (ok { available-points: u0, total-spent: u0, total-orders: u0, potential-discount: u0 })
+        )
+    )
 )
