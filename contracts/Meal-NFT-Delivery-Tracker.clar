@@ -405,3 +405,73 @@
         )
     )
 )
+
+(define-constant ERR-INVALID-RATING (err u112))
+(define-constant ERR-NO-DELIVERY-PERSON (err u113))
+(define-constant ERR-ALREADY-RATED (err u114))
+
+(define-constant MIN-RATING u1)
+(define-constant MAX-RATING u5)
+
+(define-map delivery-feedback uint {
+    rater: principal,
+    score: uint
+})
+
+(define-map restaurant-rating-stats principal {
+    total-score: uint,
+    count: uint
+})
+
+(define-map delivery-rating-stats principal {
+    total-score: uint,
+    count: uint
+})
+
+(define-public (rate-delivery (nft-id uint) (score uint))
+    (let (
+        (meal-data (unwrap! (map-get? meals nft-id) ERR-NFT-NOT-FOUND))
+        (maybe-driver (get delivery-person meal-data))
+        (driver (unwrap! maybe-driver ERR-NO-DELIVERY-PERSON))
+        (current-restaurant (get restaurant meal-data))
+        (existing (map-get? delivery-feedback nft-id))
+        (rest-stats (default-to { total-score: u0, count: u0 } (map-get? restaurant-rating-stats current-restaurant)))
+        (drv-stats (default-to { total-score: u0, count: u0 } (map-get? delivery-rating-stats driver)))
+    )
+        (asserts! (is-eq tx-sender (get customer meal-data)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status meal-data) MEAL-STATUS-DELIVERED) ERR-INVALID-STATUS)
+        (asserts! (and (>= score MIN-RATING) (<= score MAX-RATING)) ERR-INVALID-RATING)
+        (asserts! (is-none existing) ERR-ALREADY-RATED)
+        (map-set delivery-feedback nft-id {
+            rater: tx-sender,
+            score: score
+        })
+        (map-set restaurant-rating-stats current-restaurant {
+            total-score: (+ (get total-score rest-stats) score),
+            count: (+ (get count rest-stats) u1)
+        })
+        (map-set delivery-rating-stats driver {
+            total-score: (+ (get total-score drv-stats) score),
+            count: (+ (get count drv-stats) u1)
+        })
+        (ok true)
+    )
+)
+
+(define-read-only (get-delivery-rating (nft-id uint))
+    (map-get? delivery-feedback nft-id)
+)
+
+(define-read-only (get-restaurant-average-rating (restaurant principal))
+    (match (map-get? restaurant-rating-stats restaurant)
+        stats (some { average: (/ (get total-score stats) (get count stats)), count: (get count stats) })
+        none
+    )
+)
+
+(define-read-only (get-delivery-person-average-rating (driver principal))
+    (match (map-get? delivery-rating-stats driver)
+        stats (some { average: (/ (get total-score stats) (get count stats)), count: (get count stats) })
+        none
+    )
+)
