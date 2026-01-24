@@ -475,3 +475,88 @@
         none
     )
 )
+
+(define-constant ERR-REFUND-NOT-ELIGIBLE (err u115))
+(define-constant ERR-REFUND-ALREADY-REQUESTED (err u116))
+(define-constant ERR-REFUND-NOT-FOUND (err u117))
+(define-constant ERR-REFUND-ALREADY-PROCESSED (err u118))
+
+(define-constant REFUND-STATUS-PENDING u0)
+(define-constant REFUND-STATUS-APPROVED u1)
+(define-constant REFUND-STATUS-REJECTED u2)
+
+(define-map refund-requests uint {
+    customer: principal,
+    reason: (string-ascii 100),
+    requested-at: uint,
+    status: uint,
+    processed-by: (optional principal),
+    processed-at: (optional uint)
+})
+
+(define-map customer-refund-history principal (list 20 uint))
+
+(define-public (request-refund (nft-id uint) (reason (string-ascii 100)))
+    (let (
+        (meal-data (unwrap! (map-get? meals nft-id) ERR-NFT-NOT-FOUND))
+        (existing-request (map-get? refund-requests nft-id))
+        (current-history (default-to (list) (map-get? customer-refund-history tx-sender)))
+    )
+        (asserts! (is-eq tx-sender (get customer meal-data)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-none existing-request) ERR-REFUND-ALREADY-REQUESTED)
+        (asserts! (or 
+            (not (check-freshness nft-id))
+            (is-eq (get status meal-data) MEAL-STATUS-ORDERED)
+            (is-eq (get status meal-data) MEAL-STATUS-PREPARING)
+        ) ERR-REFUND-NOT-ELIGIBLE)
+        (map-set refund-requests nft-id {
+            customer: tx-sender,
+            reason: reason,
+            requested-at: stacks-block-height,
+            status: REFUND-STATUS-PENDING,
+            processed-by: none,
+            processed-at: none
+        })
+        (map-set customer-refund-history tx-sender 
+            (unwrap! (as-max-len? (append current-history nft-id) u20) ERR-INVALID-RECIPIENT))
+        (ok true)
+    )
+)
+
+(define-public (process-refund (nft-id uint) (approve bool))
+    (let (
+        (meal-data (unwrap! (map-get? meals nft-id) ERR-NFT-NOT-FOUND))
+        (refund-data (unwrap! (map-get? refund-requests nft-id) ERR-REFUND-NOT-FOUND))
+    )
+        (asserts! (or 
+            (is-eq tx-sender (var-get contract-owner))
+            (is-eq tx-sender (get restaurant meal-data))
+        ) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status refund-data) REFUND-STATUS-PENDING) ERR-REFUND-ALREADY-PROCESSED)
+        (map-set refund-requests nft-id (merge refund-data {
+            status: (if approve REFUND-STATUS-APPROVED REFUND-STATUS-REJECTED),
+            processed-by: (some tx-sender),
+            processed-at: (some stacks-block-height)
+        }))
+        (ok approve)
+    )
+)
+
+(define-read-only (get-refund-request (nft-id uint))
+    (map-get? refund-requests nft-id)
+)
+
+(define-read-only (get-customer-refund-history (customer principal))
+    (default-to (list) (map-get? customer-refund-history customer))
+)
+
+(define-read-only (is-refund-eligible (nft-id uint))
+    (match (map-get? meals nft-id)
+        meal-data (or 
+            (not (check-freshness nft-id))
+            (is-eq (get status meal-data) MEAL-STATUS-ORDERED)
+            (is-eq (get status meal-data) MEAL-STATUS-PREPARING)
+        )
+        false
+    )
+)
